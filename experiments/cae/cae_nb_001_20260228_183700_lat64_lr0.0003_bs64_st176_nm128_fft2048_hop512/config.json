@@ -1,0 +1,37 @@
+{
+  "run_name": "cae_nb_001_20260228_183700_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512",
+  "run_dir": "/Users/kate/untitled folder 10/s26_genai_project/experiments/cae/cae_nb_001_20260228_183700_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512",
+  "device": "cpu",
+  "data_dir": "/Users/kate/untitled folder 10/UrbanSound8K",
+  "audio_unpacked_dir": "/Users/kate/untitled folder 10/UrbanSound8K/audio_unpacked",
+  "spec_dir": "/Users/kate/untitled folder 10/UrbanSound8K/spectrograms",
+  "train": {
+    "epochs": 80,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "num_workers": 2,
+    "val_ratio": 0.1,
+    "seed": 43,
+    "pin_memory": false,
+    "grad_clip": 1.0,
+    "patience": 12,
+    "es_min_delta": 0.0001,
+    "image_log_every": 10,
+    "ckpt_path": "/Users/kate/untitled folder 10/s26_genai_project/experiments/cae/cae_nb_001_20260228_183700_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512/checkpoints/cae_best.pt",
+    "log_dir": "/Users/kate/untitled folder 10/s26_genai_project/experiments/cae/cae_nb_001_20260228_183700_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512/tb"
+  },
+  "model": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 64,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176
+  },
+  "eval": {
+    "batch_size": 64,
+    "noise_std": 0.5,
+    "griffin_lim_iters": 60
+  }
+}

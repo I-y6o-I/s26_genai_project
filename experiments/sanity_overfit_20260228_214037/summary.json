@@ -1,0 +1,31 @@
+{
+  "mode": "sanity_overfit",
+  "train_config": {
+    "epochs": 40,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "batch_size": 16,
+    "num_workers": 0,
+    "val_ratio": 0.1,
+    "seed": 42,
+    "pin_memory": false,
+    "grad_clip": 1.0,
+    "patience": 50,
+    "es_min_delta": 0.0001,
+    "image_log_every": 10,
+    "ckpt_path": "experiments/sanity_overfit_20260228_214037/ckpt_best.pt",
+    "log_dir": "experiments/sanity_overfit_20260228_214037/tb"
+  },
+  "model_config": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 128,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176
+  },
+  "best_val": 0.16026072204113007,
+  "best_epoch": 40,
+  "epochs_ran": 40,
+  "ckpt_path": "experiments/sanity_overfit_20260228_214037/ckpt_best.pt"
+}
