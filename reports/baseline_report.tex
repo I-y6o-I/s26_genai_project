@@ -1,0 +1,96 @@
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+
+\title{Baseline Report: Conditional Audio Autoencoder}
+\author{Kirill Shumskiy, Ekaterina Petrova}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent Repository: \href{https://github.com/I-y6o-I/s26_genai_project/tree/main}{https://github.com/I-y6o-I/s26\_genai\_project/tree/main}
+
+\section{Baseline Implementation}
+The baseline model is a class-conditional autoencoder for log-mel spectrograms.
+Input spectrograms are encoded with a residual convolutional encoder and projected to a latent vector \(z\).
+Class information is injected through learned label embeddings, so both encoding and decoding are conditioned on the target sound class.
+
+The decoder mirrors the encoder with upsampling residual blocks and reconstructs a spectrogram with a \(\tanh\) output head.
+Training minimizes reconstruction L1 loss on normalized log-mel features, with AdamW, cosine learning-rate decay, gradient clipping, early stopping, and checkpointing.
+
+In short, this baseline is designed to learn \emph{reconstruction quality first} and then test how far latent sampling can be used for generation.
+
+\section{Dataset and Preprocessing}
+Minimal pipeline: compute log-mel spectrograms and save \texttt{.npy} features.
+Defaults: 22{,}050 Hz, \texttt{n\_mels=128}, \texttt{n\_fft=2048}, \texttt{hop=512}, fixed \texttt{spec\_t=176}.
+In loader, features are pad/crop + normalized to approximately \([-1,1]\).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.58\linewidth]{figures/spec_example_1.png}
+\caption{Example of preprocessed log-mel spectrogram used for training.}
+\end{figure}
+
+\section{Evaluation Outputs}
+Quantitative metrics: log-mel L1 (primary), MR-STFT, SI-SDR, FAD, diversity.
+
+Qualitative outputs from inference:
+\texttt{spectrograms.png}, \texttt{gt.wav}, \texttt{recon.wav}, \texttt{gen.wav}
+under run-specific folders.
+
+Executed qualitative export for the best run
+(\texttt{cae\_nb\_005\_...\_lat256\_lr0.0003}) to:
+\texttt{experiments/cae/cae\_nb\_005\_...\!/qualitative\_samples/}.
+Each sample is stored as
+\texttt{sample\_\{id\}\_class\_\{label\}/\{spectrograms.png, gt.wav, recon.wav, gen.wav\}}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.47\linewidth]{figures/qualitative_example.png}
+\hfill
+\includegraphics[width=0.47\linewidth]{figures/sanity_learning_curve.png}
+\caption{Qualitative sample (left) and sanity-check learning curve (right).}
+\end{figure}
+
+\section{Conducted Experiments and Results}
+\textbf{Main sweep (6 runs).}
+Hyperparameters: \texttt{latent\_dim \(\in\) \{64,128,256\}}, \texttt{lr \(\in\) \{3e-4,1e-4\}};
+fixed \texttt{batch\_size=64}, \texttt{spec\_t=176}, \texttt{n\_mels=128}, \texttt{n\_fft=2048}, \texttt{hop=512}.
+Artifacts are stored in \texttt{experiments/cae/}.
+
+\begin{center}
+\begin{tabular}{lcccc}
+\hline
+Run setup & Best val L1 & Log-mel L1 & MR-STFT & FAD \\
+\hline
+Lat64, LR 3e-4  & 0.1158 & 0.1158 & 2.1177 & 18077.4 \\
+Lat64, LR 1e-4  & 0.1296 & 0.1296 & 2.5739 &  6119.3 \\
+Lat128, LR 3e-4 & 0.1099 & 0.1099 & 2.1025 & 31312.7 \\
+Lat128, LR 1e-4 & 0.1190 & 0.1190 & 2.3779 &  9289.4 \\
+Lat256, LR 3e-4 & \textbf{0.1081} & \textbf{0.1081} & \textbf{2.0958} & 41224.8 \\
+Lat256, LR 1e-4 & 0.1094 & 0.1094 & 2.1259 & 14051.2 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Sanity check (tiny-subset overfit).}
+Run: \texttt{experiments/sanity\_overfit\_20260228\_214037}.
+Setup: \texttt{overfit\_samples=32}, \texttt{epochs=40}, \texttt{batch\_size=16}, \texttt{latent\_dim=128}, \texttt{lr=3e-4}.
+
+Result: best val L1 \(=0.1603\); train L1 \(0.5277 \rightarrow 0.1677\) (\(-68.2\%\)),
+val L1 \(0.4187 \rightarrow 0.1603\) (\(-61.7\%\)).
+
+\section*{Conclusion}
+The model works as a \emph{reconstruction} baseline but is weak as a \emph{generator}.
+In experiments, reconstruction metrics improved (best val/log-mel L1 \(=0.1081\)),
+while generation metrics stayed poor (high FAD and very low fake diversity versus real diversity).
+Therefore, the main takeaway is: \textbf{this AE does not really learn generation}, which is expected,
+because a plain AE is not designed to learn a valid sampling prior in latent space.
+
+\end{document}
