@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -21,10 +22,8 @@ class ResBlock(nn.Module):
 
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1, transpose: bool = False) -> None:
         super().__init__()
-        conv = nn.ConvTranspose2d if transpose else nn.Conv2d
-
         if transpose:
-            self.conv1 = conv(
+            self.conv1 = nn.ConvTranspose2d(
                 in_ch,
                 out_ch,
                 kernel_size=3,
@@ -33,7 +32,7 @@ class ResBlock(nn.Module):
                 output_padding=stride - 1,
             )
         else:
-            self.conv1 = conv(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+            self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
 
         self.bn1 = nn.BatchNorm2d(out_ch)
         self.relu = nn.ReLU(inplace=True)
@@ -95,6 +94,37 @@ class Encoder(nn.Module):
         return self.fc(torch.cat([flat, emb], dim=1))
 
 
+class VariationalEncoder(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embedding = nn.Embedding(config.n_classes, config.embed_dim)
+
+        ch = [config.base_ch * (2**i) for i in range(4)]
+        self.blocks = nn.Sequential(
+            ResBlock(1, ch[0], stride=2),
+            ResBlock(ch[0], ch[1], stride=2),
+            ResBlock(ch[1], ch[2], stride=2),
+            ResBlock(ch[2], ch[3], stride=2),
+        )
+
+        h_out = config.spec_h // 16
+        t_out = config.spec_t // 16
+        flat_dim = ch[3] * h_out * t_out
+
+        self.embed_proj = nn.Linear(config.embed_dim, ch[3])
+        self.fc_mu = nn.Linear(flat_dim + ch[3], config.latent_dim)
+        self.fc_logvar = nn.Linear(flat_dim + ch[3], config.latent_dim)
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = self.blocks(x)
+        flat = feat.flatten(1)
+        emb = self.embedding(labels)
+        emb = self.embed_proj(emb)
+        joined = torch.cat([flat, emb], dim=1)
+        return self.fc_mu(joined), self.fc_logvar(joined)
+
+
 class Decoder(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -147,6 +177,67 @@ class ConditionalAE(nn.Module):
         labels = labels.to(device)
         z = torch.randn(labels.shape[0], self.config.latent_dim, device=device) * noise_std
         return self.decoder(z, labels)
+
+
+def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+
+class ConditionalVAE(nn.Module):
+    def __init__(self, config: ModelConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or ModelConfig()
+        self.encoder = VariationalEncoder(self.config)
+        self.decoder = Decoder(self.config)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        mu, logvar = self.encoder(x, labels)
+        z = reparameterize(mu, logvar)
+        x_hat = self.decoder(z, labels)
+        return x_hat, {"z": z, "mu": mu, "logvar": logvar}
+
+    @torch.no_grad()
+    def generate(
+        self,
+        labels: torch.Tensor,
+        device: torch.device | None = None,
+        noise_std: float = 1.0,
+    ) -> torch.Tensor:
+        if device is None:
+            device = next(self.parameters()).device
+        labels = labels.to(device)
+        z = torch.randn(labels.shape[0], self.config.latent_dim, device=device) * noise_std
+        return self.decoder(z, labels)
+
+
+def unpack_model_output(
+    output: tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    x_hat, latent = output
+    if isinstance(latent, dict):
+        z = latent["z"]
+        mu = latent.get("mu")
+        logvar = latent.get("logvar")
+        return x_hat, z, mu, logvar
+    return x_hat, latent, None, None
+
+
+def build_model(
+    model_type: Literal["ae", "vae"],
+    config: ModelConfig,
+) -> nn.Module:
+    if model_type == "ae":
+        return ConditionalAE(config=config)
+    if model_type == "vae":
+        return ConditionalVAE(config=config)
+    
+    raise ValueError(f"Unsupported model_type={model_type}. Use 'ae' or 'vae'.")
 
 
 def count_trainable_parameters(model: nn.Module) -> int:
