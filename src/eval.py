@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src.model import ConditionalAE, Encoder, ModelConfig
+from src.model import ModelConfig, build_model, unpack_model_output
 from src.train import TrainConfig, build_dataloaders
 from src.utils import (
     denorm_log_mel,
@@ -81,16 +81,20 @@ def si_sdr(target: np.ndarray, estimate: np.ndarray, eps: float = 1e-8) -> float
 
 
 class EmbeddingExtractor(nn.Module):
-    """Returns latent vectors using the trained encoder."""
+    """Returns deterministic latent embeddings for FAD/diversity metrics."""
 
-    def __init__(self, encoder: Encoder) -> None:
+    def __init__(self, model: nn.Module) -> None:
         super().__init__()
-        self.encoder = encoder
+        self.model = model
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dummy_labels = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        return self.encoder(x, dummy_labels)
+        encoder_out = self.model.encoder(x, dummy_labels)
+        if isinstance(encoder_out, tuple):
+            mu, _ = encoder_out
+            return mu
+        return encoder_out
 
 
 @torch.no_grad()
@@ -138,7 +142,7 @@ def collect_reconstructions(
 
     for x, y in tqdm(val_loader, desc="Collecting reconstructions"):
         x, y = x.to(device), y.to(device)
-        x_hat, _ = model(x, y)
+        x_hat, _, _, _ = unpack_model_output(model(x, y))
         all_gt.append(x.cpu())
         all_recon.append(x_hat.cpu())
         all_labels.append(y.cpu())
@@ -204,7 +208,7 @@ def evaluate_model(
         batch_size=config.batch_size,
         noise_std=config.noise_std,
     )
-    embedder = EmbeddingExtractor(model.encoder).to(device)
+    embedder = EmbeddingExtractor(model).to(device)
     embedder.eval()
     emb_real = get_embeddings(gt_specs, embedder, device, batch_size=config.batch_size)
     emb_fake = get_embeddings(fake_specs, embedder, device, batch_size=config.batch_size)
@@ -243,7 +247,7 @@ def save_qualitative_samples(
         for x, y in val_loader:
             x = x.to(device)
             y = y.to(device)
-            x_hat, _ = model(x, y)
+            x_hat, _, _, _ = unpack_model_output(model(x, y))
             x_gen = model.generate(y, device=device, noise_std=noise_std)
 
             x_db = denorm_log_mel(x.cpu())
@@ -295,7 +299,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Clean inference/evaluation script for Conditional AE baseline.")
+    parser = argparse.ArgumentParser(description="Inference/evaluation script for conditional AE / conditional VAE.")
     parser.add_argument("--data-dir", type=Path, default=Path("UrbanSound8K"))
     parser.add_argument("--spec-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -307,6 +311,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--spec-t", type=int, default=176)
     parser.add_argument("--n-mels", type=int, default=128)
+    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae"])
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--base-ch", type=int, default=32)
@@ -349,7 +354,7 @@ def main() -> None:
         spec_h=args.n_mels,
         spec_t=args.spec_t,
     )
-    model = ConditionalAE(config=model_cfg).to(device)
+    model = build_model(model_type=args.model_type, config=model_cfg).to(device)
 
     eval_cfg = EvalConfig(
         batch_size=args.batch_size,

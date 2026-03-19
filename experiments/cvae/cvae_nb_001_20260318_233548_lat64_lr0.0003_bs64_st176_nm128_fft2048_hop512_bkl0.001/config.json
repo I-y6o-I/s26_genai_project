@@ -1,0 +1,39 @@
+{
+  "run_name": "cvae_nb_001_20260318_233548_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512_bkl0.001",
+  "run_dir": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvae/cvae_nb_001_20260318_233548_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512_bkl0.001",
+  "device": "cuda",
+  "data_dir": "/mnt/shared/gen_ai_proj_data/UrbanSound8K",
+  "audio_unpacked_dir": "/mnt/shared/gen_ai_proj_data/UrbanSound8K/audio_unpacked",
+  "spec_dir": "/mnt/shared/gen_ai_proj_data/UrbanSound8K/spectrograms",
+  "train": {
+    "model_type": "vae",
+    "epochs": 100,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "num_workers": 2,
+    "val_ratio": 0.1,
+    "seed": 43,
+    "pin_memory": true,
+    "grad_clip": 1.0,
+    "beta_kl": 0.001,
+    "patience": 12,
+    "es_min_delta": 0.0001,
+    "image_log_every": 10,
+    "ckpt_path": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvae/cvae_nb_001_20260318_233548_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512_bkl0.001/checkpoints/cvae_best.pt",
+    "log_dir": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvae/cvae_nb_001_20260318_233548_lat64_lr0.0003_bs64_st176_nm128_fft2048_hop512_bkl0.001/tb"
+  },
+  "model": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 64,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176
+  },
+  "eval": {
+    "batch_size": 64,
+    "noise_std": 0.5,
+    "griffin_lim_iters": 60
+  }
+}

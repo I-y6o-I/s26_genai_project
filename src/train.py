@@ -6,6 +6,8 @@ import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from typing import Literal
+from typing import Sized, TypedDict, cast
 
 import numpy as np
 import pandas as pd
@@ -14,10 +16,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
-from src.model import ConditionalAE, ModelConfig, count_trainable_parameters
-from src.utils import (
+# python src/train.py --data-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/ --audio-unpacked-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/audio_unpacked/ --spec-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/spectrograms/ --epochs 100 --num-workers 8 --beta-kl 0.001 --sanity-overfit
+
+from .model import ModelConfig, build_model, count_trainable_parameters, unpack_model_output
+from .utils import (
     get_device,
     load_metadata,
     resolve_urbansound_data_dir,
@@ -34,7 +38,7 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:  # pragma: no cover - optional dependency
 
-    class SummaryWriter:  # type: ignore[override]
+    class _FallbackSummaryWriter:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
@@ -56,9 +60,12 @@ except Exception:  # pragma: no cover - optional dependency
         def close(self) -> None:
             pass
 
+    SummaryWriter = _FallbackSummaryWriter
+
 
 @dataclass
 class TrainConfig:
+    model_type: Literal["ae", "vae"] = "ae"
     epochs: int = 150
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -68,11 +75,24 @@ class TrainConfig:
     seed: int = 42
     pin_memory: bool = True
     grad_clip: float = 1.0
+    beta_kl: float = 1e-3
     patience: int = 15
     es_min_delta: float = 1e-4
     image_log_every: int = 10
     ckpt_path: Path = Path("checkpoints/cae_best.pt")
     log_dir: Path = Path("runs/cae")
+
+
+class TrainResult(TypedDict):
+    best_val: float
+    best_epoch: int
+    train_losses: list[float]
+    val_losses: list[float]
+    ckpt_path: str
+
+
+def _loader_dataset_len(loader: DataLoader) -> int:
+    return len(cast(Sized, loader.dataset))
 
 
 class SpectrogramDataset(Dataset):
@@ -156,11 +176,12 @@ def build_overfit_dataloaders(
 ) -> tuple[DataLoader, DataLoader]:
     """Build train/val loaders from the same tiny subset for sanity checking."""
     base_ds = train_loader.dataset
-    subset_size = min(overfit_samples, len(base_ds))
+    base_ds_len = len(cast(Sized, base_ds))
+    subset_size = min(overfit_samples, base_ds_len)
     if subset_size < 1:
         raise ValueError("Overfit subset is empty. Increase --overfit-samples.")
 
-    indices = torch.randperm(len(base_ds), generator=torch.Generator().manual_seed(config.seed)).tolist()
+    indices = torch.randperm(base_ds_len, generator=torch.Generator().manual_seed(config.seed)).tolist()
     tiny_ds = Subset(base_ds, indices[:subset_size])
 
     tiny_batch = min(config.batch_size, subset_size)
@@ -185,6 +206,11 @@ def reconstruction_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(x_hat, x)
 
 
+def kl_divergence_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    return per_sample.mean()
+
+
 def _to_img(t: torch.Tensor) -> torch.Tensor:
     t = t - t.min()
     return t / (t.max() + 1e-8)
@@ -196,7 +222,7 @@ def train_model(
     val_loader: DataLoader,
     device: torch.device,
     config: TrainConfig,
-) -> dict[str, float | int | list[float] | str]:
+) -> TrainResult:
     config.ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,33 +246,72 @@ def train_model(
     for epoch in tqdm(range(1, config.epochs + 1), desc="Training"):
         model.train()
         train_running = 0.0
+        train_recon_running = 0.0
+        train_kl_running = 0.0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            x_hat, _ = model(x, y)
-            loss = reconstruction_loss(x_hat, x)
+            x_hat, _, mu, logvar = unpack_model_output(model(x, y))
+
+            recon = reconstruction_loss(x_hat, x)
+            if config.model_type == "vae":
+                if mu is None or logvar is None:
+                    raise RuntimeError("VAE mode requires model outputs with mu/logvar.")
+                
+                kl = kl_divergence_loss(mu, logvar)
+                loss = recon + config.beta_kl * kl
+            else:
+                kl = torch.zeros((), device=device)
+                loss = recon
+
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
             train_running += loss.item() * x.size(0)
-        train_loss = train_running / len(train_loader.dataset)
+            train_recon_running += recon.item() * x.size(0)
+            train_kl_running += kl.item() * x.size(0)
+            
+        train_dataset_len = _loader_dataset_len(train_loader)
+        train_loss = train_running / train_dataset_len
+        train_recon_loss = train_recon_running / train_dataset_len
+        train_kl_loss = train_kl_running / train_dataset_len
 
         model.eval()
         val_running = 0.0
+        val_recon_running = 0.0
+        val_kl_running = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                x_hat, _ = model(x, y)
-                val_running += reconstruction_loss(x_hat, x).item() * x.size(0)
-        val_loss = val_running / len(val_loader.dataset)
+                x_hat, _, mu, logvar = unpack_model_output(model(x, y))
+                recon = reconstruction_loss(x_hat, x)
+                if config.model_type == "vae":
+                    if mu is None or logvar is None:
+                        raise RuntimeError("VAE mode requires model outputs with mu/logvar.")
+                    kl = kl_divergence_loss(mu, logvar)
+                    total = recon + config.beta_kl * kl
+                else:
+                    kl = torch.zeros((), device=device)
+                    total = recon
+
+                val_running += total.item() * x.size(0)
+                val_recon_running += recon.item() * x.size(0)
+                val_kl_running += kl.item() * x.size(0)
+        val_dataset_len = _loader_dataset_len(val_loader)
+        val_loss = val_running / val_dataset_len
+        val_recon_loss = val_recon_running / val_dataset_len
+        val_kl_loss = val_kl_running / val_dataset_len
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch)
+        writer.add_scalars("Loss/total", {"train": train_loss, "val": val_loss}, epoch)
+        writer.add_scalars("Loss/reconstruction", {"train": train_recon_loss, "val": val_recon_loss}, epoch)
+        if config.model_type == "vae":
+            writer.add_scalars("Loss/kl", {"train": train_kl_loss, "val": val_kl_loss}, epoch)
         writer.add_scalar("LR", current_lr, epoch)
 
         total_norm = 0.0
@@ -260,7 +325,7 @@ def train_model(
                 x_sample, y_sample = next(iter(val_loader))
                 x_sample = x_sample[:8].to(device)
                 y_sample = y_sample[:8].to(device)
-                x_hat_sample, _ = model(x_sample, y_sample)
+                x_hat_sample, _, _, _ = unpack_model_output(model(x_sample, y_sample))
 
             grid_real = torchvision.utils.make_grid(_to_img(x_sample), nrow=4)
             grid_recon = torchvision.utils.make_grid(_to_img(x_hat_sample), nrow=4)
@@ -276,11 +341,19 @@ def train_model(
             es_counter += 1
 
         if epoch % 5 == 0 or epoch == 1:
-            print(
-                f"Epoch {epoch:3d}/{config.epochs} "
-                f"train L1={train_loss:.4f} val L1={val_loss:.4f} "
-                f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
-            )
+            if config.model_type == "vae":
+                print(
+                    f"Epoch {epoch:3d}/{config.epochs} "
+                    f"train total={train_loss:.4f} recon={train_recon_loss:.4f} kl={train_kl_loss:.4f} "
+                    f"val total={val_loss:.4f} recon={val_recon_loss:.4f} kl={val_kl_loss:.4f} "
+                    f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch:3d}/{config.epochs} "
+                    f"train L1={train_loss:.4f} val L1={val_loss:.4f} "
+                    f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
+                )
 
         if es_counter >= config.patience:
             print(f"Early stopping at epoch {epoch} (patience={config.patience}).")
@@ -316,7 +389,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Clean training script for Conditional AE baseline.")
+    parser = argparse.ArgumentParser(description="Training script for conditional AE / conditional VAE.")
     parser.add_argument("--data-dir", type=Path, default=Path("UrbanSound8K"))
     parser.add_argument("--audio-dir", type=Path, default=None)
     parser.add_argument("--audio-unpacked-dir", type=Path, default=None)
@@ -330,6 +403,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae"])
+    parser.add_argument("--beta-kl", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -378,8 +453,10 @@ def main() -> None:
         )
 
     train_cfg = TrainConfig(
+        model_type=args.model_type,
         epochs=args.epochs,
         lr=args.lr,
+        beta_kl=args.beta_kl,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_ratio=args.val_ratio,
@@ -402,7 +479,7 @@ def main() -> None:
             config=train_cfg,
             overfit_samples=args.overfit_samples,
         )
-        print(f"Sanity overfit mode enabled on {len(train_loader.dataset)} samples.")
+        print(f"Sanity overfit mode enabled on {_loader_dataset_len(train_loader)} samples.")
 
     model_cfg = ModelConfig(
         n_classes=int(metadata["classID"].nunique()),
@@ -412,7 +489,7 @@ def main() -> None:
         spec_h=args.n_mels,
         spec_t=args.spec_t,
     )
-    model = ConditionalAE(config=model_cfg).to(device)
+    model = build_model(model_type=train_cfg.model_type, config=model_cfg).to(device)
     print(f"Trainable params: {count_trainable_parameters(model):,}")
 
     result = train_model(
