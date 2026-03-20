@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 # python src/train.py --data-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/ --audio-unpacked-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/audio_unpacked/ --spec-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/spectrograms/ --epochs 100 --num-workers 8 --beta-kl 0.001 --sanity-overfit
 
+from .latent_stats import fit_latent_stats, save_latent_stats
 from .model import ModelConfig, build_model, count_trainable_parameters, unpack_model_output
 from .utils import (
     get_device,
@@ -500,6 +501,21 @@ def main() -> None:
         config=train_cfg,
     )
 
+    latent_stats_path: Path | None = None
+    if train_cfg.model_type == "vae":
+        model.load_state_dict(torch.load(result["ckpt_path"], map_location=device))
+        latent_stats = fit_latent_stats(
+            model=model,
+            data_loader=train_loader,
+            device=device,
+            n_classes=model_cfg.n_classes,
+        )
+        latent_stats_path = save_latent_stats(
+            latent_stats,
+            args.ckpt_path.parent.parent / "latent_stats.pt",
+        )
+        print(f"Latent stats saved to {latent_stats_path}")
+
     payload = {
         "mode": "sanity_overfit" if args.sanity_overfit else "standard_train",
         "train_config": asdict(train_cfg),
@@ -508,6 +524,7 @@ def main() -> None:
         "best_epoch": result["best_epoch"],
         "epochs_ran": len(result["train_losses"]),
         "ckpt_path": result["ckpt_path"],
+        "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
     }
     args.summary_path.parent.mkdir(parents=True, exist_ok=True)
     args.summary_path.write_text(json.dumps(_jsonable(payload), indent=2))
@@ -517,4 +534,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

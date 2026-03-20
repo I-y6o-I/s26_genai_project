@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from src.latent_stats import fit_latent_stats, generate_from_stats, load_latent_stats
 from src.model import ModelConfig, build_model, unpack_model_output
 from src.train import TrainConfig, build_dataloaders
 from src.utils import (
@@ -44,6 +45,7 @@ class EvalConfig:
     batch_size: int = 128
     noise_std: float = 0.5
     griffin_lim_iters: int = 60
+    sampling_mode: str = "prior"
 
 
 def stft_mag(wave: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
@@ -160,11 +162,26 @@ def generate_fake_specs(
     device: torch.device,
     batch_size: int = 128,
     noise_std: float = 0.5,
+    sampling_mode: str = "prior",
+    latent_stats: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     fake_specs: list[torch.Tensor] = []
     for i in range(0, len(labels), batch_size):
         batch_labels = labels[i : i + batch_size].to(device)
-        fake_specs.append(model.generate(batch_labels, device=device, noise_std=noise_std).cpu())
+        if sampling_mode == "prior":
+            batch_fake = model.generate(batch_labels, device=device, noise_std=noise_std)
+        else:
+            if latent_stats is None:
+                raise ValueError(f"sampling_mode={sampling_mode} requires latent_stats.")
+            batch_fake = generate_from_stats(
+                model,
+                labels=batch_labels,
+                latent_stats=latent_stats,
+                device=device,
+                mode=sampling_mode,
+                temperature=noise_std,
+            )
+        fake_specs.append(batch_fake.cpu())
     return torch.cat(fake_specs)
 
 
@@ -174,6 +191,7 @@ def evaluate_model(
     device: torch.device,
     config: EvalConfig | None = None,
     checkpoint_path: str | Path | None = None,
+    latent_stats: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     config = config or EvalConfig()
     if checkpoint_path is not None:
@@ -207,6 +225,8 @@ def evaluate_model(
         device=device,
         batch_size=config.batch_size,
         noise_std=config.noise_std,
+        sampling_mode=config.sampling_mode,
+        latent_stats=latent_stats,
     )
     embedder = EmbeddingExtractor(model).to(device)
     embedder.eval()
@@ -237,6 +257,8 @@ def save_qualitative_samples(
     noise_std: float = 0.5,
     griffin_lim_iters: int = 60,
     sample_rate: int = 22050,
+    sampling_mode: str = "prior",
+    latent_stats: dict[str, torch.Tensor] | None = None,
 ) -> Path:
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -248,7 +270,19 @@ def save_qualitative_samples(
             x = x.to(device)
             y = y.to(device)
             x_hat, _, _, _ = unpack_model_output(model(x, y))
-            x_gen = model.generate(y, device=device, noise_std=noise_std)
+            if sampling_mode == "prior":
+                x_gen = model.generate(y, device=device, noise_std=noise_std)
+            else:
+                if latent_stats is None:
+                    raise ValueError(f"sampling_mode={sampling_mode} requires latent_stats.")
+                x_gen = generate_from_stats(
+                    model,
+                    labels=y,
+                    latent_stats=latent_stats,
+                    device=device,
+                    mode=sampling_mode,
+                    temperature=noise_std,
+                )
 
             x_db = denorm_log_mel(x.cpu())
             xhat_db = denorm_log_mel(x_hat.cpu())
@@ -317,6 +351,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-ch", type=int, default=32)
 
     parser.add_argument("--noise-std", type=float, default=0.5)
+    parser.add_argument(
+        "--sampling-mode",
+        type=str,
+        default="prior",
+        choices=["prior", "posterior", "class_posterior", "mu_cluster"],
+    )
+    parser.add_argument("--latent-stats", type=Path, default=None)
+    parser.add_argument("--latent-stats-split", type=str, default="train", choices=["train", "val"])
     parser.add_argument("--griffin-iters", type=int, default=60)
     parser.add_argument("--qualitative-count", type=int, default=4)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/inference"))
@@ -339,7 +381,7 @@ def main() -> None:
         seed=args.seed,
         pin_memory=device.type == "cuda",
     )
-    _, _, val_loader = build_dataloaders(
+    _, train_loader, val_loader = build_dataloaders(
         metadata=metadata,
         spec_dir=spec_dir,
         config=train_cfg,
@@ -355,18 +397,43 @@ def main() -> None:
         spec_t=args.spec_t,
     )
     model = build_model(model_type=args.model_type, config=model_cfg).to(device)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    print(f"Loaded checkpoint: {args.checkpoint}")
 
     eval_cfg = EvalConfig(
         batch_size=args.batch_size,
         noise_std=args.noise_std,
         griffin_lim_iters=args.griffin_iters,
+        sampling_mode=args.sampling_mode,
     )
+
+    latent_stats_path = args.latent_stats
+    latent_stats: dict[str, torch.Tensor] | None = None
+    if args.sampling_mode != "prior":
+        if latent_stats_path is None:
+            run_dir = args.checkpoint.resolve().parent.parent
+            for candidate_name in ("latent_stats.pt", "latent_stats_val.pt"):
+                candidate = run_dir / candidate_name
+                if candidate.is_file():
+                    latent_stats_path = candidate
+                    break
+        if latent_stats_path is not None and latent_stats_path.is_file():
+            latent_stats = load_latent_stats(latent_stats_path, device=device)
+        else:
+            source_loader = train_loader if args.latent_stats_split == "train" else val_loader
+            latent_stats = fit_latent_stats(
+                model=model,
+                data_loader=source_loader,
+                device=device,
+                n_classes=model_cfg.n_classes,
+            )
+
     metrics = evaluate_model(
         model=model,
         val_loader=val_loader,
         device=device,
         config=eval_cfg,
-        checkpoint_path=args.checkpoint,
+        latent_stats=latent_stats,
     )
 
     qual_dir = save_qualitative_samples(
@@ -377,6 +444,8 @@ def main() -> None:
         count=args.qualitative_count,
         noise_std=args.noise_std,
         griffin_lim_iters=args.griffin_iters,
+        sampling_mode=args.sampling_mode,
+        latent_stats=latent_stats,
     )
 
     payload = {
@@ -386,6 +455,7 @@ def main() -> None:
         "spec_dir": spec_dir,
         "model_config": asdict(model_cfg),
         "eval_config": asdict(eval_cfg),
+        "latent_stats_path": latent_stats_path,
         "qualitative_dir": qual_dir,
     }
     args.metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,4 +470,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
