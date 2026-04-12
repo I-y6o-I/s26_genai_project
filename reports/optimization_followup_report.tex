@@ -1,0 +1,122 @@
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+
+\title{Optimization Follow-Up: cVAE Training Tricks Without Architecture Changes}
+\author{Kirill Shumskiy, Ekaterina Petrova}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+This short follow-up isolates a narrow question: can we improve the current cVAE by changing only the optimization recipe, while leaving the architecture unchanged?
+
+The reference model is the best run from the main report, \texttt{cvae\_nb\_005}, with:
+\begin{itemize}
+\item latent size \(64\),
+\item learning rate \(3 \cdot 10^{-4}\),
+\item batch size \(64\),
+\item \(\beta = 10^{-3}\),
+\item the same UrbanSound8K spectrogram setup as in the main report.
+\end{itemize}
+
+\section{What Changed}
+We tested a sequence of optimization-only follow-ups while keeping the architecture and data preprocessing fixed.
+
+\paragraph{Follow-up A: warmup + free bits.}
+This run added:
+\begin{itemize}
+\item linear KL warmup over the first 25 epochs;
+\item free bits with threshold \(0.01\) per latent dimension.
+\end{itemize}
+Run id:
+\texttt{cvae\_tricks\_20260411\_210250\_lat64\_lr0.0003\_bs64\_bkl0.001\_warm25\_fb001}.
+
+\paragraph{Follow-up B: EMA on top of the same schedule.}
+We then added exponential moving average weights with \texttt{ema\_decay=0.999},
+while leaving the previous warmup/free-bits settings unchanged.
+Run id:
+\texttt{cvae\_ema\_20260412\_181315\_lat64\_lr0.0003\_bs64\_bkl0.001}.
+
+\paragraph{Follow-up C: EMA + retuned schedule.}
+Finally, we kept EMA but shortened and softened the KL regularization schedule:
+\begin{itemize}
+\item KL warmup reduced to 10 epochs;
+\item free bits reduced to \(0.005\);
+\item training length increased to 120 epochs;
+\item patience increased to 30.
+\end{itemize}
+Run id:
+\texttt{cvae\_ema\_tricks\_20260412\_183413\_lat64\_lr0.0003\_bs64\_bkl0.001\_warm10\_fb0005}.
+
+\section{Results}
+Table~\ref{tab:tricks_compare} compares the previous best cVAE with all three follow-up runs.
+
+\begin{table}[h]
+\centering
+\caption{Best baseline cVAE vs optimization-only follow-up series.}
+\label{tab:tricks_compare}
+\begin{tabular}{lccccc}
+\toprule
+Run & Best val & Log-mel L1 & MR-STFT & FAD & Div. ratio \\
+\midrule
+\texttt{cvae\_nb\_005} & 0.1058 & 0.0918 & 1.8971 & \textbf{3.0198} & \textbf{0.5711} \\
+\texttt{cvae\_tricks\_20260411\_210250} & 0.1106 & 0.0985 & 1.9268 & 16.0544 & 0.5136 \\
+\texttt{cvae\_ema\_20260412\_181315} & 0.4291 & -- & -- & -- & -- \\
+\texttt{cvae\_ema\_tricks\_20260412\_183413} & \textbf{0.1048} & \textbf{0.0909} & \textbf{1.8873} & 3.2587 & 0.5588 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results separate into three clear regimes:
+\begin{itemize}
+\item warmup + free bits alone hurt both reconstruction and generation badly;
+\item adding EMA on top of that untuned schedule was unstable and collapsed validation quality very early;
+\item EMA combined with a shorter warmup, smaller free-bits threshold, and longer training produced the best validation objective and the best reconstruction metrics of all runs.
+\end{itemize}
+
+However, the new best training objective does \emph{not} translate into the best generation score.
+The strongest EMA-based run improves over \texttt{cvae\_nb\_005} on best validation loss, log-mel L1, and MR-STFT,
+but its FAD is slightly worse (\(3.2587\) vs \(3.0198\)), and its diversity ratio is also slightly lower (\(0.5588\) vs \(0.5711\)).
+
+So the updated conclusion is more nuanced than in the first follow-up:
+EMA plus a better-tuned KL schedule improves reconstruction,
+but the original \texttt{cvae\_nb\_005} is still slightly better as a generator under the current FAD metric.
+
+\section{Interpretation}
+This follow-up still narrows the search space in a useful way.
+Two conclusions are now fairly clear.
+
+\begin{itemize}
+\item EMA is not automatically helpful in this setup; with the original warmup/free-bits schedule it was clearly harmful.
+\item EMA becomes useful only after the KL schedule is retuned. In that regime it improves reconstruction, but does not yet beat the original best checkpoint on prior-matching quality.
+\end{itemize}
+
+One plausible interpretation is that the retuned EMA run learns a cleaner reconstruction manifold, while the older \texttt{cvae\_nb\_005} still matches the sampling prior slightly better under standard-normal generation.
+That would explain why the new run wins on reconstruction metrics but loses on FAD.
+
+\section{Artifacts}
+The main artifacts for this follow-up series are stored under:
+\begin{itemize}
+\item \texttt{experiments/cvae/cvae\_tricks\_20260411\_210250\_lat64\_lr0.0003\_bs64\_bkl0.001\_warm25\_fb001/}
+\item \texttt{experiments/cvae/cvae\_ema\_20260412\_181315\_lat64\_lr0.0003\_bs64\_bkl0.001/}
+\item \texttt{experiments/cvae/cvae\_ema\_tricks\_20260412\_183413\_lat64\_lr0.0003\_bs64\_bkl0.001\_warm10\_fb0005/}
+\item each run stores \texttt{train\_summary.json};
+\item the evaluated runs also store \texttt{eval/metrics.json} and \texttt{eval/qualitative/}.
+\end{itemize}
+
+\section*{Conclusion}
+The optimization-only follow-up series produced one meaningful improvement:
+EMA with a retuned KL schedule gives the best validation objective and the best reconstruction metrics seen so far.
+But it still does not beat the older \texttt{cvae\_nb\_005} on FAD, so the best generator in the current report remains unchanged.
+The practical takeaway is that optimization tricks can help, but they are shifting the reconstruction--generation trade-off rather than solving it outright.
+
+\end{document}
