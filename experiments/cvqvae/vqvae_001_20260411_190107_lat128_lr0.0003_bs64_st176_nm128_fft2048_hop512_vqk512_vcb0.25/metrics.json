@@ -1,0 +1,34 @@
+{
+  "metrics": {
+    "logmel_l1": 0.044643521308898926,
+    "mr_stft": 1.3987545172373455,
+    "si_sdr": -26.387309865551995,
+    "fad": 23.928211507735675,
+    "diversity_real": 0.371649831533432,
+    "diversity_fake": 0.6700887680053711
+  },
+  "checkpoint": "experiments/cvqvae/vqvae_001_20260411_190107_lat128_lr0.0003_bs64_st176_nm128_fft2048_hop512_vqk512_vcb0.25/checkpoints/vqvae_best.pt",
+  "data_dir": "/mnt/shared/gen_ai_proj_data/UrbanSound8K",
+  "spec_dir": "/mnt/shared/gen_ai_proj_data/UrbanSound8K/spectrograms",
+  "model_config": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 128,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176,
+    "vq_num_embeddings": 512,
+    "vq_commitment_beta": 0.25,
+    "vq_ema_decay": 0.99,
+    "vq_ema_eps": 1e-05
+  },
+  "eval_config": {
+    "batch_size": 64,
+    "noise_std": 0.5,
+    "griffin_lim_iters": 60,
+    "sampling_mode": "prior",
+    "prior_top_k": 50
+  },
+  "latent_stats_path": null,
+  "qualitative_dir": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvqvae/vqvae_001_20260411_190107_lat128_lr0.0003_bs64_st176_nm128_fft2048_hop512_vqk512_vcb0.25/qualitative"
+}

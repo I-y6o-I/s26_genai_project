@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
+
 
 try:
     import librosa
@@ -19,6 +22,50 @@ DEFAULT_SR = 22050
 DEFAULT_N_MELS = 128
 DEFAULT_N_FFT = 2048
 DEFAULT_HOP_LENGTH = 512
+
+
+def make_run_name(
+    run_prefix: str,
+    hp: dict[str, Any],
+    run_idx: int = 1,
+    stamp: str | None = None,
+) -> str:
+    stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = (
+        f"{run_prefix}_{run_idx:03d}_{stamp}"
+        f"_lat{hp['latent_dim']}_lr{hp['lr']}_bs{hp['batch_size']}"
+        f"_st{hp['spec_t']}_nm{hp['n_mels']}_fft{hp['n_fft']}_hop{hp['hop_length']}"
+    )
+    if "beta_kl" in hp:
+        name += f"_bkl{hp['beta_kl']}"
+    if "vq_num_embeddings" in hp:
+        name += f"_vqk{hp['vq_num_embeddings']}"
+    if "vq_commitment_beta" in hp:
+        name += f"_vcb{hp['vq_commitment_beta']}"
+    return name
+
+
+def make_run_paths(
+    experiments_dir: str | Path,
+    run_name: str,
+    ckpt_filename: str,
+    summary_filename: str,
+) -> dict[str, Path]:
+    experiments_dir = Path(experiments_dir).resolve()
+    run_dir = experiments_dir / run_name
+    tb_dir = run_dir / "tb"
+    ckpt_path = run_dir / "checkpoints" / ckpt_filename
+    summary_path = run_dir / summary_filename
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    return {
+        "run_dir": run_dir,
+        "tb_dir": tb_dir,
+        "ckpt_path": ckpt_path,
+        "summary_path": summary_path,
+    }
 
 
 def _require_librosa() -> None:
