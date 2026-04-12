@@ -1,0 +1,39 @@
+{
+  "best_val": 3.568935183998099,
+  "best_epoch": 97,
+  "vq_checkpoint": "experiments/cvqvae/vqvae_001_20260411_190107_lat128_lr0.0003_bs64_st176_nm128_fft2048_hop512_vqk512_vcb0.25/checkpoints/vqvae_best.pt",
+  "prior_checkpoint": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvqvae/pixelcnn_prior_001_20260411_215330_lat128_lr0.0002_bs64_st176_nm128_fft0_hop0_vqk512/checkpoints/prior_best.pt",
+  "prior_config": {
+    "num_embeddings": 512,
+    "n_classes": 10,
+    "hidden_dim": 128,
+    "n_layers": 10,
+    "kernel_size": 5
+  },
+  "vq_model_config": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 128,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176,
+    "vq_num_embeddings": 512,
+    "vq_commitment_beta": 0.25,
+    "vq_ema_decay": 0.99,
+    "vq_ema_eps": 1e-05
+  },
+  "train_config": {
+    "epochs": 100,
+    "lr": 0.0002,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "batch_size": 64,
+    "num_workers": 2,
+    "val_ratio": 0.1,
+    "seed": 42,
+    "patience": 8,
+    "es_min_delta": 0.0001,
+    "ckpt_path": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvqvae/pixelcnn_prior_001_20260411_215330_lat128_lr0.0002_bs64_st176_nm128_fft0_hop0_vqk512/checkpoints/prior_best.pt",
+    "summary_path": "/home/kirill/Files/IU_Cources/S26_GenAI/s26_genai_project/experiments/cvqvae/pixelcnn_prior_001_20260411_215330_lat128_lr0.0002_bs64_st176_nm128_fft0_hop0_vqk512/prior_summary.json"
+  }
+}

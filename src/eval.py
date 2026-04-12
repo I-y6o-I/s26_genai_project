@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -13,13 +14,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.latent_stats import fit_latent_stats, generate_from_stats, load_latent_stats
-from src.model import ModelConfig, build_model, unpack_model_output
+from src.model import ConditionalVQVAE, ModelConfig, build_model, unpack_model_output
+from src.model import PriorConfig, build_prior
 from src.train import TrainConfig, build_dataloaders
 from src.utils import (
     denorm_log_mel,
     get_device,
     load_metadata,
+    make_run_name,
+    make_run_paths,
     resolve_urbansound_data_dir,
     spec_to_waveform,
 )
@@ -46,6 +53,7 @@ class EvalConfig:
     noise_std: float = 0.5
     griffin_lim_iters: int = 60
     sampling_mode: str = "prior"
+    prior_top_k: int = 50
 
 
 def stft_mag(wave: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
@@ -92,10 +100,12 @@ class EmbeddingExtractor(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dummy_labels = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        encoder_out = self.model.encoder(x, dummy_labels)
+        encoder_out = cast(Any, self.model).encoder(x, dummy_labels)
         if isinstance(encoder_out, tuple):
             mu, _ = encoder_out
             return mu
+        if encoder_out.ndim == 4:
+            return encoder_out.mean(dim=(2, 3))
         return encoder_out
 
 
@@ -164,12 +174,26 @@ def generate_fake_specs(
     noise_std: float = 0.5,
     sampling_mode: str = "prior",
     latent_stats: dict[str, torch.Tensor] | None = None,
+    vq_prior: nn.Module | None = None,
+    allow_random_vq_generation: bool = False,
+    prior_top_k: int = 50,
 ) -> torch.Tensor:
     fake_specs: list[torch.Tensor] = []
     for i in range(0, len(labels), batch_size):
         batch_labels = labels[i : i + batch_size].to(device)
         if sampling_mode == "prior":
-            batch_fake = model.generate(batch_labels, device=device, noise_std=noise_std)
+            if isinstance(model, ConditionalVQVAE):
+                batch_fake = model.generate(
+                    batch_labels,
+                    device=device,
+                    noise_std=noise_std,
+                    prior=vq_prior,
+                    temperature=noise_std,
+                    top_k=prior_top_k,
+                    allow_random_fallback=allow_random_vq_generation,
+                )
+            else:
+                batch_fake = cast(Any, model).generate(batch_labels, device=device, noise_std=noise_std)
         else:
             if latent_stats is None:
                 raise ValueError(f"sampling_mode={sampling_mode} requires latent_stats.")
@@ -192,6 +216,9 @@ def evaluate_model(
     config: EvalConfig | None = None,
     checkpoint_path: str | Path | None = None,
     latent_stats: dict[str, torch.Tensor] | None = None,
+    vq_prior: nn.Module | None = None,
+    allow_random_vq_generation: bool = False,
+    prior_top_k: int = 50,
 ) -> dict[str, float]:
     config = config or EvalConfig()
     if checkpoint_path is not None:
@@ -227,6 +254,9 @@ def evaluate_model(
         noise_std=config.noise_std,
         sampling_mode=config.sampling_mode,
         latent_stats=latent_stats,
+        vq_prior=vq_prior,
+        allow_random_vq_generation=allow_random_vq_generation,
+        prior_top_k=prior_top_k,
     )
     embedder = EmbeddingExtractor(model).to(device)
     embedder.eval()
@@ -259,6 +289,9 @@ def save_qualitative_samples(
     sample_rate: int = 22050,
     sampling_mode: str = "prior",
     latent_stats: dict[str, torch.Tensor] | None = None,
+    vq_prior: nn.Module | None = None,
+    allow_random_vq_generation: bool = False,
+    prior_top_k: int = 50,
 ) -> Path:
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,7 +304,18 @@ def save_qualitative_samples(
             y = y.to(device)
             x_hat, _, _, _ = unpack_model_output(model(x, y))
             if sampling_mode == "prior":
-                x_gen = model.generate(y, device=device, noise_std=noise_std)
+                if isinstance(model, ConditionalVQVAE):
+                    x_gen = model.generate(
+                        y,
+                        device=device,
+                        noise_std=noise_std,
+                        prior=vq_prior,
+                        temperature=noise_std,
+                        top_k=prior_top_k,
+                        allow_random_fallback=allow_random_vq_generation,
+                    )
+                else:
+                    x_gen = cast(Any, model).generate(y, device=device, noise_std=noise_std)
             else:
                 if latent_stats is None:
                     raise ValueError(f"sampling_mode={sampling_mode} requires latent_stats.")
@@ -307,7 +351,7 @@ def save_qualitative_samples(
                         ax.set_xlabel("time")
                         ax.set_ylabel("mel")
                     plt.tight_layout()
-                    fig.savefig(sample_dir / "spectrograms.png", dpi=140)
+                    fig.savefig(str(sample_dir / "spectrograms.png"), dpi=140)
                     plt.close(fig)
 
                 if sf is not None:
@@ -333,7 +377,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inference/evaluation script for conditional AE / conditional VAE.")
+    parser = argparse.ArgumentParser(description="Inference/evaluation script for conditional AE / conditional VAE / conditional VQ-VAE.")
     parser.add_argument("--data-dir", type=Path, default=Path("UrbanSound8K"))
     parser.add_argument("--spec-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -345,10 +389,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--spec-t", type=int, default=176)
     parser.add_argument("--n-mels", type=int, default=128)
-    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae"])
+    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae", "vqvae"])
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--base-ch", type=int, default=32)
+    parser.add_argument("--vq-num-embeddings", type=int, default=512)
+    parser.add_argument("--vq-commitment-beta", type=float, default=0.25)
+    parser.add_argument("--vq-ema-decay", type=float, default=0.99)
+    parser.add_argument("--vq-ema-eps", type=float, default=1e-5)
+    parser.add_argument("--vq-prior-checkpoint", type=Path, default=None)
+    parser.add_argument("--prior-hidden-dim", type=int, default=256)
+    parser.add_argument("--prior-layers", type=int, default=8)
+    parser.add_argument("--prior-heads", type=int, default=8)
+    parser.add_argument("--prior-dropout", type=float, default=0.1)
+    parser.add_argument("--prior-max-seq-len", type=int, default=4096)
+    parser.add_argument("--prior-max-h-tokens", type=int, default=64)
+    parser.add_argument("--prior-max-w-tokens", type=int, default=64)
+    parser.add_argument("--prior-top-k", type=int, default=50)
+    parser.add_argument("--allow-random-vq-generation", action="store_true")
+    parser.add_argument("--experiments-dir", type=Path, default=None)
+    parser.add_argument("--run-prefix", type=str, default=None)
+    parser.add_argument("--run-idx", type=int, default=1)
 
     parser.add_argument("--noise-std", type=float, default=0.5)
     parser.add_argument(
@@ -361,8 +422,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latent-stats-split", type=str, default="train", choices=["train", "val"])
     parser.add_argument("--griffin-iters", type=int, default=60)
     parser.add_argument("--qualitative-count", type=int, default=4)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/inference"))
-    parser.add_argument("--metrics-path", type=Path, default=Path("outputs/inference/metrics.json"))
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--metrics-path", type=Path, default=None)
     return parser
 
 
@@ -373,6 +434,39 @@ def main() -> None:
     data_dir = resolve_urbansound_data_dir(args.data_dir)
     spec_dir = (args.spec_dir or (data_dir / "spectrograms")).resolve()
     metadata = load_metadata(data_dir)
+
+    hp_for_name = {
+        "latent_dim": args.latent_dim,
+        "lr": 0,
+        "batch_size": args.batch_size,
+        "spec_t": args.spec_t,
+        "n_mels": args.n_mels,
+        "n_fft": 0,
+        "hop_length": 0,
+    }
+    if args.model_type == "vae":
+        hp_for_name["beta_kl"] = 0
+    if args.model_type == "vqvae":
+        hp_for_name["vq_num_embeddings"] = args.vq_num_embeddings
+        hp_for_name["vq_commitment_beta"] = args.vq_commitment_beta
+
+    experiment_group = args.model_type
+    experiments_dir = (args.experiments_dir or (Path(__file__).resolve().parents[1] / "experiments" / experiment_group)).resolve()
+    run_prefix = args.run_prefix or args.model_type
+    run_name = make_run_name(run_prefix=run_prefix, hp=hp_for_name, run_idx=args.run_idx)
+    auto_paths = make_run_paths(
+        experiments_dir=experiments_dir,
+        run_name=run_name,
+        ckpt_filename="unused.pt",
+        summary_filename="metrics.json",
+    )
+    output_dir = (args.output_dir.resolve() if args.output_dir is not None else auto_paths["run_dir"] / "inference")
+    metrics_path = (args.metrics_path.resolve() if args.metrics_path is not None else output_dir / "metrics.json")
+
+    print(f"Eval run name: {run_name}")
+    print(f"Eval run dir: {auto_paths['run_dir']}")
+    print(f"Eval output dir: {output_dir}")
+    print(f"Eval metrics path: {metrics_path}")
 
     train_cfg = TrainConfig(
         batch_size=args.batch_size,
@@ -395,16 +489,51 @@ def main() -> None:
         base_ch=args.base_ch,
         spec_h=args.n_mels,
         spec_t=args.spec_t,
+        vq_num_embeddings=args.vq_num_embeddings,
+        vq_commitment_beta=args.vq_commitment_beta,
+        vq_ema_decay=args.vq_ema_decay,
+        vq_ema_eps=args.vq_ema_eps,
     )
     model = build_model(model_type=args.model_type, config=model_cfg).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     print(f"Loaded checkpoint: {args.checkpoint}")
+
+    vq_prior: nn.Module | None = None
+    if args.model_type == "vqvae":
+        if args.vq_prior_checkpoint is not None:
+            prior_cfg = PriorConfig(
+                num_embeddings=args.vq_num_embeddings,
+                n_classes=model_cfg.n_classes,
+                hidden_dim=args.prior_hidden_dim,
+                n_layers=args.prior_layers,
+                n_heads=args.prior_heads,
+                dropout=args.prior_dropout,
+                max_seq_len=args.prior_max_seq_len,
+                max_h_tokens=args.prior_max_h_tokens,
+                max_w_tokens=args.prior_max_w_tokens,
+                top_k=args.prior_top_k,
+            )
+            vq_prior = build_prior(prior_cfg).to(device)
+            prior_payload = torch.load(args.vq_prior_checkpoint, map_location=device)
+            state = prior_payload.get("prior_state_dict", prior_payload)
+            vq_prior.load_state_dict(state)
+            vq_prior.eval()
+            print(f"Loaded VQ prior checkpoint: {args.vq_prior_checkpoint}")
+        elif not args.allow_random_vq_generation:
+            raise ValueError(
+                "model-type='vqvae' requires --vq-prior-checkpoint for meaningful generation. "
+                "Use --allow-random-vq-generation only for debugging."
+            )
+
+    if args.model_type != "vae" and args.sampling_mode != "prior":
+        raise ValueError("sampling-mode values other than 'prior' are supported only for model-type='vae'.")
 
     eval_cfg = EvalConfig(
         batch_size=args.batch_size,
         noise_std=args.noise_std,
         griffin_lim_iters=args.griffin_iters,
         sampling_mode=args.sampling_mode,
+        prior_top_k=args.prior_top_k,
     )
 
     latent_stats_path = args.latent_stats
@@ -434,18 +563,24 @@ def main() -> None:
         device=device,
         config=eval_cfg,
         latent_stats=latent_stats,
+        vq_prior=vq_prior,
+        allow_random_vq_generation=args.allow_random_vq_generation,
+        prior_top_k=args.prior_top_k,
     )
 
     qual_dir = save_qualitative_samples(
         model=model,
         val_loader=val_loader,
         device=device,
-        out_dir=args.output_dir / "qualitative",
+        out_dir=output_dir / "qualitative",
         count=args.qualitative_count,
         noise_std=args.noise_std,
         griffin_lim_iters=args.griffin_iters,
         sampling_mode=args.sampling_mode,
         latent_stats=latent_stats,
+        vq_prior=vq_prior,
+        allow_random_vq_generation=args.allow_random_vq_generation,
+        prior_top_k=args.prior_top_k,
     )
 
     payload = {
@@ -458,13 +593,13 @@ def main() -> None:
         "latent_stats_path": latent_stats_path,
         "qualitative_dir": qual_dir,
     }
-    args.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    args.metrics_path.write_text(json.dumps(_jsonable(payload), indent=2))
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps(_jsonable(payload), indent=2))
 
     print("Quantitative metrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:.4f}")
-    print(f"Metrics JSON: {args.metrics_path}")
+    print(f"Metrics JSON: {metrics_path}")
     print(f"Qualitative samples: {qual_dir}")
 
 
