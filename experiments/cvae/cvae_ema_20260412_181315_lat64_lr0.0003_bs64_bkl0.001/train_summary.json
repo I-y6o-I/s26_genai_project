@@ -1,0 +1,37 @@
+{
+  "mode": "standard_train",
+  "train_config": {
+    "model_type": "vae",
+    "epochs": 100,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "num_workers": 2,
+    "val_ratio": 0.1,
+    "seed": 42,
+    "pin_memory": false,
+    "grad_clip": 1.0,
+    "beta_kl": 0.001,
+    "beta_warmup_epochs": 25,
+    "kl_free_bits": 0.01,
+    "ema_decay": 0.999,
+    "patience": 15,
+    "es_min_delta": 0.0001,
+    "image_log_every": 10,
+    "ckpt_path": "experiments/cvae/cvae_ema_20260412_181315_lat64_lr0.0003_bs64_bkl0.001/checkpoints/cvae_best.pt",
+    "log_dir": "experiments/cvae/cvae_ema_20260412_181315_lat64_lr0.0003_bs64_bkl0.001/tb"
+  },
+  "model_config": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 64,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176
+  },
+  "best_val": 0.42910794331718827,
+  "best_epoch": 2,
+  "epochs_ran": 17,
+  "ckpt_path": "experiments/cvae/cvae_ema_20260412_181315_lat64_lr0.0003_bs64_bkl0.001/checkpoints/cvae_best.pt",
+  "latent_stats_path": "/Users/kate/untitled folder 10/s26_genai_project/experiments/cvae/cvae_ema_20260412_181315_lat64_lr0.0003_bs64_bkl0.001/latent_stats.pt"
+}

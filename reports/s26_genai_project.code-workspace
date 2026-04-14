@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "s26_genai_project",
+			"path": ".."
+		},
+		{
+			"name": "UrbanSound8K",
+			"path": "../../../Downloads/UrbanSound8K"
+		}
+	],
+	"settings": {}
+}

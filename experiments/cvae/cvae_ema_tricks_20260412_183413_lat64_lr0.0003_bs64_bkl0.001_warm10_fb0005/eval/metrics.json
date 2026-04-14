@@ -1,0 +1,29 @@
+{
+  "metrics": {
+    "logmel_l1": 0.09090933203697205,
+    "mr_stft": 1.8873002131779988,
+    "si_sdr": -42.18206024169922,
+    "fad": 3.2586660873326165,
+    "diversity_real": 0.3276512622833252,
+    "diversity_fake": 0.18309712409973145
+  },
+  "checkpoint": "experiments/cvae/cvae_ema_tricks_20260412_183413_lat64_lr0.0003_bs64_bkl0.001_warm10_fb0005/checkpoints/cvae_best.pt",
+  "data_dir": "/Users/kate/untitled folder 10/UrbanSound8K",
+  "spec_dir": "/Users/kate/untitled folder 10/UrbanSound8K/spectrograms",
+  "model_config": {
+    "n_classes": 10,
+    "embed_dim": 32,
+    "latent_dim": 64,
+    "base_ch": 32,
+    "spec_h": 128,
+    "spec_t": 176
+  },
+  "eval_config": {
+    "batch_size": 64,
+    "noise_std": 0.5,
+    "griffin_lim_iters": 60,
+    "sampling_mode": "prior"
+  },
+  "latent_stats_path": null,
+  "qualitative_dir": "/Users/kate/untitled folder 10/s26_genai_project/experiments/cvae/cvae_ema_tricks_20260412_183413_lat64_lr0.0003_bs64_bkl0.001_warm10_fb0005/eval/qualitative"
+}

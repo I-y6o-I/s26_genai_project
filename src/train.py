@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import sys
@@ -83,6 +84,9 @@ class TrainConfig:
     pin_memory: bool = True
     grad_clip: float = 1.0
     beta_kl: float = 1e-3
+    beta_warmup_epochs: int = 25
+    kl_free_bits: float = 0.01
+    ema_decay: float = 0.999
     patience: int = 15
     es_min_delta: float = 1e-4
     image_log_every: int = 10
@@ -218,6 +222,61 @@ def kl_divergence_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return per_sample.mean()
 
 
+def kl_divergence_per_dim(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+
+def free_bits_kl_loss(mu: torch.Tensor, logvar: torch.Tensor, free_bits: float) -> torch.Tensor:
+    per_dim = kl_divergence_per_dim(mu, logvar)
+    if free_bits <= 0:
+        return per_dim.sum(dim=1).mean()
+    return per_dim.mean(dim=0).clamp_min(free_bits).sum()
+
+
+def effective_beta(epoch: int, config: TrainConfig) -> float:
+    if config.model_type != "vae":
+        return 0.0
+    if config.beta_warmup_epochs <= 0:
+        return config.beta_kl
+    warmup_progress = min(epoch / config.beta_warmup_epochs, 1.0)
+    return config.beta_kl * warmup_progress
+
+
+def should_use_ema(config: TrainConfig) -> bool:
+    return 0.0 < config.ema_decay < 1.0
+
+
+def build_ema_model(model: torch.nn.Module, config: TrainConfig) -> torch.nn.Module | None:
+    if not should_use_ema(config):
+        return None
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def update_ema_model(
+    ema_model: torch.nn.Module,
+    model: torch.nn.Module,
+    decay: float,
+) -> None:
+    ema_params = dict(ema_model.named_parameters())
+    model_params = dict(model.named_parameters())
+    for name, ema_param in ema_params.items():
+        ema_param.mul_(decay).add_(model_params[name], alpha=1.0 - decay)
+
+    ema_buffers = dict(ema_model.named_buffers())
+    model_buffers = dict(model.named_buffers())
+    for name, ema_buffer in ema_buffers.items():
+        model_buffer = model_buffers[name]
+        if ema_buffer.dtype.is_floating_point:
+            ema_buffer.mul_(decay).add_(model_buffer, alpha=1.0 - decay)
+        else:
+            ema_buffer.copy_(model_buffer)
+
+
 def _to_img(t: torch.Tensor) -> torch.Tensor:
     t = t - t.min()
     return t / (t.max() + 1e-8)
@@ -236,6 +295,7 @@ def train_model(
     optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
     writer = SummaryWriter(log_dir=str(config.log_dir))
+    ema_model = build_ema_model(model, config)
 
     dummy_x = torch.zeros(1, 1, 128, getattr(model, "config").spec_t, device=device)
     dummy_y = torch.zeros(1, dtype=torch.long, device=device)
@@ -252,6 +312,7 @@ def train_model(
 
     for epoch in tqdm(range(1, config.epochs + 1), desc="Training"):
         model.train()
+        beta = effective_beta(epoch, config)
         train_running = 0.0
         train_recon_running = 0.0
         train_kl_running = 0.0
@@ -266,7 +327,7 @@ def train_model(
             if config.model_type == "vae":
                 if mu is None or logvar is None:
                     raise RuntimeError("VAE mode requires model outputs with mu/logvar.")
-                
+
                 kl = kl_divergence_loss(mu, logvar)
                 loss = recon + config.beta_kl * kl
                 vq = torch.zeros((), device=device)
@@ -286,6 +347,8 @@ def train_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, model, config.ema_decay)
             train_running += loss.item() * x.size(0)
             train_recon_running += recon.item() * x.size(0)
             train_kl_running += kl.item() * x.size(0)
@@ -298,6 +361,8 @@ def train_model(
         train_vq_loss = train_vq_running / train_dataset_len
 
         model.eval()
+        eval_model = ema_model if ema_model is not None else model
+        eval_model.eval()
         val_running = 0.0
         val_recon_running = 0.0
         val_kl_running = 0.0
@@ -360,7 +425,7 @@ def train_model(
                 x_sample, y_sample = next(iter(val_loader))
                 x_sample = x_sample[:8].to(device)
                 y_sample = y_sample[:8].to(device)
-                x_hat_sample, _, _, _ = unpack_model_output(model(x_sample, y_sample))
+                x_hat_sample, _, _, _ = unpack_model_output(eval_model(x_sample, y_sample))
 
             grid_real = torchvision.utils.make_grid(_to_img(x_sample), nrow=4)
             grid_recon = torchvision.utils.make_grid(_to_img(x_hat_sample), nrow=4)
@@ -371,7 +436,8 @@ def train_model(
             best_val = val_loss
             best_epoch = epoch
             es_counter = 0
-            torch.save(model.state_dict(), config.ckpt_path)
+            best_state = eval_model.state_dict()
+            torch.save(best_state, config.ckpt_path)
         else:
             es_counter += 1
 
@@ -381,6 +447,8 @@ def train_model(
                     f"Epoch {epoch:3d}/{config.epochs} "
                     f"train total={train_loss:.4f} recon={train_recon_loss:.4f} kl={train_kl_loss:.4f} "
                     f"val total={val_loss:.4f} recon={val_recon_loss:.4f} kl={val_kl_loss:.4f} "
+                    f"beta={beta:.2e} "
+                    f"ema={config.ema_decay:.4f} "
                     f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
                 )
             elif config.model_type == "vqvae":
@@ -447,13 +515,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae", "vqvae"])
     parser.add_argument("--beta-kl", type=float, default=1e-3)
+    parser.add_argument("--beta-warmup-epochs", type=int, default=25)
+    parser.add_argument("--kl-free-bits", type=float, default=0.01)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--spec-t", type=int, default=176)
-    parser.add_argument("--latent-dim", type=int, default=128)
+    parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--base-ch", type=int, default=32)
     parser.add_argument("--vq-num-embeddings", type=int, default=512)
@@ -541,6 +612,9 @@ def main() -> None:
         epochs=args.epochs,
         lr=args.lr,
         beta_kl=args.beta_kl,
+        beta_warmup_epochs=args.beta_warmup_epochs,
+        kl_free_bits=args.kl_free_bits,
+        ema_decay=args.ema_decay,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_ratio=args.val_ratio,
