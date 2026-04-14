@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import random
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,13 +20,18 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from tqdm import tqdm
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 # python src/train.py --data-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/ --audio-unpacked-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/audio_unpacked/ --spec-dir /mnt/shared/gen_ai_proj_data/UrbanSound8K/spectrograms/ --epochs 100 --num-workers 8 --beta-kl 0.001 --sanity-overfit
 
-from .latent_stats import fit_latent_stats, save_latent_stats
-from .model import ModelConfig, build_model, count_trainable_parameters, unpack_model_output
-from .utils import (
+from src.latent_stats import fit_latent_stats, save_latent_stats
+from src.model import ModelConfig, build_model, count_trainable_parameters, unpack_aux_losses, unpack_model_output
+from src.utils import (
     get_device,
     load_metadata,
+    make_run_name,
+    make_run_paths,
     resolve_urbansound_data_dir,
     save_log_mel_spectrogram,
     unpack_audio,
@@ -67,7 +73,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 @dataclass
 class TrainConfig:
-    model_type: Literal["ae", "vae"] = "ae"
+    model_type: Literal["ae", "vae", "vqvae"] = "ae"
     epochs: int = 150
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -310,10 +316,12 @@ def train_model(
         train_running = 0.0
         train_recon_running = 0.0
         train_kl_running = 0.0
-        train_kl_obj_running = 0.0
+        train_vq_running = 0.0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            x_hat, _, mu, logvar = unpack_model_output(model(x, y))
+            output = model(x, y)
+            x_hat, _, mu, logvar = unpack_model_output(output)
+            aux = unpack_aux_losses(output)
 
             recon = reconstruction_loss(x_hat, x)
             if config.model_type == "vae":
@@ -321,11 +329,17 @@ def train_model(
                     raise RuntimeError("VAE mode requires model outputs with mu/logvar.")
 
                 kl = kl_divergence_loss(mu, logvar)
-                kl_obj = free_bits_kl_loss(mu, logvar, config.kl_free_bits)
-                loss = recon + beta * kl_obj
+                loss = recon + config.beta_kl * kl
+                vq = torch.zeros((), device=device)
+            elif config.model_type == "vqvae":
+                vq = aux.get("vq_loss")
+                if vq is None:
+                    raise RuntimeError("VQ-VAE mode requires model outputs with vq_loss.")
+                kl = torch.zeros((), device=device)
+                loss = recon + vq
             else:
                 kl = torch.zeros((), device=device)
-                kl_obj = kl
+                vq = torch.zeros((), device=device)
                 loss = recon
 
 
@@ -338,13 +352,13 @@ def train_model(
             train_running += loss.item() * x.size(0)
             train_recon_running += recon.item() * x.size(0)
             train_kl_running += kl.item() * x.size(0)
-            train_kl_obj_running += kl_obj.item() * x.size(0)
+            train_vq_running += vq.item() * x.size(0)
             
         train_dataset_len = _loader_dataset_len(train_loader)
         train_loss = train_running / train_dataset_len
         train_recon_loss = train_recon_running / train_dataset_len
         train_kl_loss = train_kl_running / train_dataset_len
-        train_kl_obj_loss = train_kl_obj_running / train_dataset_len
+        train_vq_loss = train_vq_running / train_dataset_len
 
         model.eval()
         eval_model = ema_model if ema_model is not None else model
@@ -352,32 +366,40 @@ def train_model(
         val_running = 0.0
         val_recon_running = 0.0
         val_kl_running = 0.0
-        val_kl_obj_running = 0.0
+        val_vq_running = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                x_hat, _, mu, logvar = unpack_model_output(eval_model(x, y))
+                output = model(x, y)
+                x_hat, _, mu, logvar = unpack_model_output(output)
+                aux = unpack_aux_losses(output)
                 recon = reconstruction_loss(x_hat, x)
                 if config.model_type == "vae":
                     if mu is None or logvar is None:
                         raise RuntimeError("VAE mode requires model outputs with mu/logvar.")
                     kl = kl_divergence_loss(mu, logvar)
-                    kl_obj = free_bits_kl_loss(mu, logvar, config.kl_free_bits)
-                    total = recon + beta * kl_obj
+                    total = recon + config.beta_kl * kl
+                    vq = torch.zeros((), device=device)
+                elif config.model_type == "vqvae":
+                    vq = aux.get("vq_loss")
+                    if vq is None:
+                        raise RuntimeError("VQ-VAE mode requires model outputs with vq_loss.")
+                    kl = torch.zeros((), device=device)
+                    total = recon + vq
                 else:
                     kl = torch.zeros((), device=device)
-                    kl_obj = kl
+                    vq = torch.zeros((), device=device)
                     total = recon
 
                 val_running += total.item() * x.size(0)
                 val_recon_running += recon.item() * x.size(0)
                 val_kl_running += kl.item() * x.size(0)
-                val_kl_obj_running += kl_obj.item() * x.size(0)
+                val_vq_running += vq.item() * x.size(0)
         val_dataset_len = _loader_dataset_len(val_loader)
         val_loss = val_running / val_dataset_len
         val_recon_loss = val_recon_running / val_dataset_len
         val_kl_loss = val_kl_running / val_dataset_len
-        val_kl_obj_loss = val_kl_obj_running / val_dataset_len
+        val_vq_loss = val_vq_running / val_dataset_len
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -388,8 +410,8 @@ def train_model(
         writer.add_scalars("Loss/reconstruction", {"train": train_recon_loss, "val": val_recon_loss}, epoch)
         if config.model_type == "vae":
             writer.add_scalars("Loss/kl", {"train": train_kl_loss, "val": val_kl_loss}, epoch)
-            writer.add_scalars("Loss/kl_objective", {"train": train_kl_obj_loss, "val": val_kl_obj_loss}, epoch)
-            writer.add_scalar("KL/beta", beta, epoch)
+        if config.model_type == "vqvae":
+            writer.add_scalars("Loss/vq", {"train": train_vq_loss, "val": val_vq_loss}, epoch)
         writer.add_scalar("LR", current_lr, epoch)
 
         total_norm = 0.0
@@ -427,6 +449,13 @@ def train_model(
                     f"val total={val_loss:.4f} recon={val_recon_loss:.4f} kl={val_kl_loss:.4f} "
                     f"beta={beta:.2e} "
                     f"ema={config.ema_decay:.4f} "
+                    f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
+                )
+            elif config.model_type == "vqvae":
+                print(
+                    f"Epoch {epoch:3d}/{config.epochs} "
+                    f"train total={train_loss:.4f} recon={train_recon_loss:.4f} vq={train_vq_loss:.4f} "
+                    f"val total={val_loss:.4f} recon={val_recon_loss:.4f} vq={val_vq_loss:.4f} "
                     f"lr={current_lr:.2e} es={es_counter}/{config.patience}"
                 )
             else:
@@ -470,7 +499,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Training script for conditional AE / conditional VAE.")
+    parser = argparse.ArgumentParser(description="Training script for conditional AE / conditional VAE / conditional VQ-VAE.")
     parser.add_argument("--data-dir", type=Path, default=Path("UrbanSound8K"))
     parser.add_argument("--audio-dir", type=Path, default=None)
     parser.add_argument("--audio-unpacked-dir", type=Path, default=None)
@@ -484,7 +513,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae"])
+    parser.add_argument("--model-type", type=str, default="ae", choices=["ae", "vae", "vqvae"])
     parser.add_argument("--beta-kl", type=float, default=1e-3)
     parser.add_argument("--beta-warmup-epochs", type=int, default=25)
     parser.add_argument("--kl-free-bits", type=float, default=0.01)
@@ -498,13 +527,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--base-ch", type=int, default=32)
+    parser.add_argument("--vq-num-embeddings", type=int, default=512)
+    parser.add_argument("--vq-commitment-beta", type=float, default=0.25)
+    parser.add_argument("--vq-ema-decay", type=float, default=0.99)
+    parser.add_argument("--vq-ema-eps", type=float, default=1e-5)
+    parser.add_argument("--experiments-dir", type=Path, default=None)
+    parser.add_argument("--run-prefix", type=str, default=None)
+    parser.add_argument("--run-idx", type=int, default=1)
 
     parser.add_argument("--sanity-overfit", action="store_true", help="Train/val on the same tiny subset.")
     parser.add_argument("--overfit-samples", type=int, default=32)
 
-    parser.add_argument("--ckpt-path", type=Path, default=Path("checkpoints/cae_best.pt"))
-    parser.add_argument("--log-dir", type=Path, default=Path("runs/cae"))
-    parser.add_argument("--summary-path", type=Path, default=Path("runs/cae/train_summary.json"))
+    parser.add_argument("--ckpt-path", type=Path, default=None)
+    parser.add_argument("--log-dir", type=Path, default=None)
+    parser.add_argument("--summary-path", type=Path, default=None)
     return parser
 
 
@@ -536,6 +572,41 @@ def main() -> None:
             hop_length=args.hop_length,
         )
 
+    hp_for_name = {
+        "latent_dim": args.latent_dim,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "spec_t": args.spec_t,
+        "n_mels": args.n_mels,
+        "n_fft": args.n_fft,
+        "hop_length": args.hop_length,
+    }
+    if args.model_type == "vae":
+        hp_for_name["beta_kl"] = args.beta_kl
+    if args.model_type == "vqvae":
+        hp_for_name["vq_num_embeddings"] = args.vq_num_embeddings
+        hp_for_name["vq_commitment_beta"] = args.vq_commitment_beta
+
+    experiment_group = args.model_type
+    experiments_dir = (args.experiments_dir or (Path(__file__).resolve().parents[1] / "experiments" / experiment_group)).resolve()
+    run_prefix = args.run_prefix or args.model_type
+    run_name = make_run_name(run_prefix=run_prefix, hp=hp_for_name, run_idx=args.run_idx)
+    auto_paths = make_run_paths(
+        experiments_dir=experiments_dir,
+        run_name=run_name,
+        ckpt_filename=f"{args.model_type}_best.pt",
+        summary_filename="train_summary.json",
+    )
+    ckpt_path = (args.ckpt_path.resolve() if args.ckpt_path is not None else auto_paths["ckpt_path"])
+    log_dir = (args.log_dir.resolve() if args.log_dir is not None else auto_paths["tb_dir"])
+    summary_path = (args.summary_path.resolve() if args.summary_path is not None else auto_paths["summary_path"])
+
+    print(f"Run name: {run_name}")
+    print(f"Run dir: {auto_paths['run_dir']}")
+    print(f"Checkpoint path: {ckpt_path}")
+    print(f"Log dir: {log_dir}")
+    print(f"Summary path: {summary_path}")
+
     train_cfg = TrainConfig(
         model_type=args.model_type,
         epochs=args.epochs,
@@ -550,8 +621,8 @@ def main() -> None:
         patience=args.patience,
         seed=args.seed,
         pin_memory=device.type == "cuda",
-        ckpt_path=args.ckpt_path,
-        log_dir=args.log_dir,
+        ckpt_path=ckpt_path,
+        log_dir=log_dir,
     )
 
     _, train_loader, val_loader = build_dataloaders(
@@ -575,6 +646,10 @@ def main() -> None:
         base_ch=args.base_ch,
         spec_h=args.n_mels,
         spec_t=args.spec_t,
+        vq_num_embeddings=args.vq_num_embeddings,
+        vq_commitment_beta=args.vq_commitment_beta,
+        vq_ema_decay=args.vq_ema_decay,
+        vq_ema_eps=args.vq_ema_eps,
     )
     model = build_model(model_type=train_cfg.model_type, config=model_cfg).to(device)
     print(f"Trainable params: {count_trainable_parameters(model):,}")
@@ -598,7 +673,7 @@ def main() -> None:
         )
         latent_stats_path = save_latent_stats(
             latent_stats,
-            args.ckpt_path.parent.parent / "latent_stats.pt",
+            ckpt_path.parent.parent / "latent_stats.pt",
         )
         print(f"Latent stats saved to {latent_stats_path}")
 
@@ -612,9 +687,9 @@ def main() -> None:
         "ckpt_path": result["ckpt_path"],
         "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
     }
-    args.summary_path.parent.mkdir(parents=True, exist_ok=True)
-    args.summary_path.write_text(json.dumps(_jsonable(payload), indent=2))
-    print(f"Summary saved to {args.summary_path}")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(_jsonable(payload), indent=2))
+    print(f"Summary saved to {summary_path}")
     print(f"TensorBoard: tensorboard --logdir {train_cfg.log_dir}")
 
 
